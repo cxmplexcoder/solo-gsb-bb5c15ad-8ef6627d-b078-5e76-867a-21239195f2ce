@@ -145,6 +145,69 @@ class ResolveResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 结果对比模型（POST /api/v1/resolutions/compare）
+# ---------------------------------------------------------------------------
+
+
+class CompareRequest(BaseModel):
+    base_fingerprint: str = Field(..., description="基线解析结果的请求指纹")
+    other_fingerprint: str = Field(..., description="待对比解析结果的请求指纹")
+
+    @field_validator("base_fingerprint", "other_fingerprint")
+    @classmethod
+    def _fingerprint(cls, v: str) -> str:
+        return v.strip()
+
+
+class ResolutionRefOut(BaseModel):
+    fingerprint: str
+    status: str
+    created_at: str
+
+
+class ComponentChangeOut(BaseModel):
+    """单条组件赋值变化。
+
+    added/removed 仅带 ``version``；upgraded/downgraded/changed 带
+    ``base_version`` 与 ``other_version``。
+    """
+
+    name: str
+    version: Optional[str] = None
+    base_version: Optional[str] = None
+    other_version: Optional[str] = None
+
+
+class ComponentDiffOut(BaseModel):
+    added: List[ComponentChangeOut] = Field(default_factory=list)
+    removed: List[ComponentChangeOut] = Field(default_factory=list)
+    upgraded: List[ComponentChangeOut] = Field(default_factory=list)
+    downgraded: List[ComponentChangeOut] = Field(default_factory=list)
+    changed: List[ComponentChangeOut] = Field(default_factory=list)
+
+
+class EdgeDiffOut(BaseModel):
+    added: List[EdgeOut] = Field(default_factory=list)
+    removed: List[EdgeOut] = Field(default_factory=list)
+
+
+class AffectedOut(BaseModel):
+    component: str = Field(description="直接或间接受变化影响的上游组件")
+    chain: List[str] = Field(
+        description="从发生变化的组件沿反向边到该组件的最短来源链（name@version）"
+    )
+    distance: int = Field(description="链长（跨越的依赖边数）")
+
+
+class CompareResponse(BaseModel):
+    base: ResolutionRefOut
+    other: ResolutionRefOut
+    components: ComponentDiffOut
+    edges: EdgeDiffOut
+    affected: List[AffectedOut]
+
+
+# ---------------------------------------------------------------------------
 # 指纹
 # ---------------------------------------------------------------------------
 

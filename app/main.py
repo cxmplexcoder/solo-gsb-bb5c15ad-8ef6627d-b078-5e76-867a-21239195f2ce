@@ -1,4 +1,4 @@
-"""FastAPI 入口：提交解析、按指纹查询、健康检查。
+"""FastAPI 入口：提交解析、按指纹查询、两份结果对比、健康检查。
 
 启动（lifespan）时自动建库建表完成初始化。
 环境变量：
@@ -16,7 +16,14 @@ import anyio
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .models import ResolveRequest, ResolveResponse, fingerprint_from_request
+from .models import (
+    CompareRequest,
+    CompareResponse,
+    ResolveRequest,
+    ResolveResponse,
+    fingerprint_from_request,
+)
+from .compare import compare_resolutions
 from .semverx import SemverError
 from .service import ResolveService
 from .solver import SolverLimitError
@@ -91,3 +98,39 @@ def get_resolution(fingerprint: str) -> dict:
     if result is None:
         raise HTTPException(status_code=404, detail="未找到该指纹对应的解析结果")
     return result
+
+
+@app.post(
+    "/api/v1/resolutions/compare",
+    response_model=CompareResponse,
+    response_model_exclude_none=True,
+    tags=["resolve"],
+    summary="对比两份已保存的解析结果",
+)
+def compare_resolutions_endpoint(req: CompareRequest) -> dict:
+    """按组件对齐两份 ``sat`` 结果的赋值，比较依赖边增删，
+    并分别沿两份图自身的反向边找出直接或间接受影响的上游组件（含最短来源链）。
+
+    任一指纹无对应结果返回 ``404``；任一方状态为 ``unsat`` 时无法对比，
+    返回 ``409``。
+    """
+    store = _store  # 闭包内取一次，便于类型收窄
+    base = store.get(req.base_fingerprint) if store else None
+    if base is None:
+        raise HTTPException(status_code=404, detail="未找到基线指纹对应的解析结果")
+    other = store.get(req.other_fingerprint) if store else None
+    if other is None:
+        raise HTTPException(status_code=404, detail="未找到待对比指纹对应的解析结果")
+    if base["status"] != "sat" or other["status"] != "sat":
+        base_unsat = base["status"] != "sat"
+        other_unsat = other["status"] != "sat"
+        which = (
+            "基线与待对比结果" if base_unsat and other_unsat
+            else "基线结果" if base_unsat
+            else "待对比结果"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=f"{which}状态为 unsat，无解结果没有赋值图，不可比较；请对比两份 sat 结果",
+        )
+    return compare_resolutions(base, other)
