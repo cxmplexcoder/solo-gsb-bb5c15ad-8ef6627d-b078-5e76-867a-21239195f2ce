@@ -1,4 +1,4 @@
-"""FastAPI 入口：提交解析、按指纹查询、健康检查。
+"""FastAPI 入口：提交解析、按指纹查询、比较两份结果、健康检查。
 
 启动（lifespan）时自动建库建表完成初始化。
 环境变量：
@@ -16,7 +16,14 @@ import anyio
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .models import ResolveRequest, ResolveResponse, fingerprint_from_request
+from .compare import ResolutionNotFound, ResolutionUnsat, compare_results, load_pair
+from .models import (
+    CompareRequest,
+    CompareResponse,
+    ResolveRequest,
+    ResolveResponse,
+    fingerprint_from_request,
+)
 from .semverx import SemverError
 from .service import ResolveService
 from .solver import SolverLimitError
@@ -45,7 +52,7 @@ app = FastAPI(
         "服务构建有向依赖图并用确定性回溯选择满足全部约束的版本；"
         "无解时返回最小冲突链与约束来源。请求指纹（SHA-256）支持幂等复用。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -91,3 +98,32 @@ def get_resolution(fingerprint: str) -> dict:
     if result is None:
         raise HTTPException(status_code=404, detail="未找到该指纹对应的解析结果")
     return result
+
+
+@app.post(
+    "/api/v1/resolutions/compare",
+    response_model=CompareResponse,
+    tags=["resolve"],
+    summary="比较两份已保存的解析结果",
+)
+def compare_resolutions(req: CompareRequest) -> dict:
+    """按组件对齐两个指纹对应的 sat 结果，分类版本变化、依赖边增删，
+    并沿两份图的反向边找出直接或间接受影响的上游组件（附最短来源链）。
+
+    任一指纹不存在返回 ``404``；任一结果为 ``unsat`` 返回 ``409``。
+    """
+    try:
+        base, target = load_pair(
+            _store, req.base_fingerprint, req.target_fingerprint  # type: ignore[arg-type]
+        )
+    except ResolutionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ResolutionUnsat as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    diff = compare_results(base, target)  # type: ignore[arg-type]
+    diff.update(
+        base_fingerprint=req.base_fingerprint,
+        target_fingerprint=req.target_fingerprint,
+    )
+    return diff

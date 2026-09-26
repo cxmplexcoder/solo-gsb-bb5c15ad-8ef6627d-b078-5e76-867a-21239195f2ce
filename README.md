@@ -42,6 +42,25 @@ curl http://localhost:8080/health
 
 SQLite 文件持久化在命名卷 `resolver-data`（容器内 `/data/resolutions.db`）。
 
+典型的 Compose 工作流：先解析两份清单拿到指纹，再调用比较接口
+（解析结果落在命名卷中，重建容器后仍可比较）：
+
+```bash
+docker compose up --build -d
+
+BASE=$(curl -s -X POST http://localhost:8080/api/v1/resolve \
+  -H 'Content-Type: application/json' -d @base.json   | jq -r .fingerprint)
+TARGET=$(curl -s -X POST http://localhost:8080/api/v1/resolve \
+  -H 'Content-Type: application/json' -d @target.json | jq -r .fingerprint)
+
+curl -s -X POST http://localhost:8080/api/v1/resolutions/compare \
+  -H 'Content-Type: application/json' \
+  -d "{\"base_fingerprint\":\"$BASE\",\"target_fingerprint\":\"$TARGET\"}"
+```
+
+停止与清理：`docker compose down`（保留数据卷）；
+如需连缓存一并删除，执行 `docker compose down -v`。
+
 ---
 
 ## 本地运行（无 Docker）
@@ -154,7 +173,73 @@ curl http://localhost:8080/api/v1/resolutions/36e45a12…ce26cc
 
 存在返回 `200`（`"reused": true`），不存在返回 `404`。
 
-### 3) 健康检查 `GET /health`
+### 3) 比较两份解析结果 `POST /api/v1/resolutions/compare`
+
+对两份**已保存**的 `sat` 结果做差异分析，请求体为两个指纹：
+
+```bash
+curl -X POST http://localhost:8080/api/v1/resolutions/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"base_fingerprint":"53dff7…c642","target_fingerprint":"c7bc8…372c"}'
+```
+
+响应包含三部分：
+
+- **`components`**：按组件名对齐两份赋值，分为五类
+  （各类内部按组件名字典序排序）：
+  - `added`：目标图新出现的组件（带 `version`）；
+  - `removed`：目标图消失的组件（带基准 `version`）；
+  - `upgraded` / `downgraded`：两侧都有且版本按 semver 升高 / 降低
+    （带 `version_from`、`version_to`）；
+  - `other`：非升非降的版本变化（semver 核心与预发布相同但原始写法不同，
+    例如仅 build metadata 差异：`1.0.0` → `1.0.0+build.7`）；
+- **`edges`**：依赖边的增删。边以 `(source, target, spec)` 为身份
+  （与两端选定版本无关）；`spec` 变化体现为“旧边删除 + 新边增加”，
+  新增/删除列表均按 `(source, target, spec)` 稳定排序；
+- **`impacted`**：直接或间接受变化影响的上游组件。以全部发生变化的组件
+  （新增、移除或版本变化）为起点，沿**两份图反向边的并集**做多源 BFS，
+  为每个可达的未变化组件给出一条最短来源链 `source_chain`
+  （从受影响组件出发沿反向边到变化源头，等长时取字典序最小），
+  结果按组件名排序。变化组件自身不在 `impacted` 中。
+
+```json
+{
+  "base_fingerprint": "53dff7…c642",
+  "target_fingerprint": "c7bc8…372c",
+  "components": {
+    "added": [],
+    "removed": [{"name": "util", "version": "1.0.0"}],
+    "upgraded": [
+      {"name": "lib", "version_from": "1.0.0", "version_to": "2.0.0"},
+      {"name": "web", "version_from": "1.0.0", "version_to": "2.0.0"}
+    ],
+    "downgraded": [],
+    "other": []
+  },
+  "edges": {
+    "added": [
+      {"source": "web", "source_version": "2.0.0",
+       "target": "lib", "target_version": "2.0.0", "spec": "^2.0.0"}
+    ],
+    "removed": [
+      {"source": "web", "source_version": "1.0.0",
+       "target": "lib", "target_version": "1.0.0", "spec": "^1.0.0"},
+      {"source": "web", "source_version": "1.0.0",
+       "target": "util", "target_version": "1.0.0", "spec": "*"}
+    ]
+  },
+  "impacted": [
+    {"component": "platform", "source_chain": ["web", "platform"]},
+    {"component": "suite", "source_chain": ["web", "platform", "suite"]}
+  ]
+}
+```
+
+错误情况：任一指纹不存在返回 **`404`**；任一指纹对应的结果状态为
+`unsat`（无赋值图可比较）返回 **`409 Conflict`**；指纹不是 64 位
+十六进制返回 **`422`**。两个指纹相同时正常返回 `200`，各差异列表为空。
+
+### 4) 健康检查 `GET /health`
 
 返回服务状态与已缓存的解析结果数量。
 
@@ -162,8 +247,9 @@ curl http://localhost:8080/api/v1/resolutions/36e45a12…ce26cc
 
 | 状态码 | 场景 |
 | --- | --- |
-| `422` | 请求体结构/semver 版本号或范围非法、组件或候选版本重复、根要求为空 |
-| `404` | 指纹无对应结果 |
+| `422` | 请求体结构/semver 版本号或范围非法、组件或候选版本重复、根要求为空；比较请求的指纹不是 64 位十六进制 |
+| `404` | 指纹无对应结果（含比较请求的任一指纹） |
+| `409` | 比较请求的任一指纹对应结果状态为 `unsat`，不可比较 |
 | `509` | 求解尝试次数超过 `SOLVER_MAX_ATTEMPTS`（保护性中止，结果不确定） |
 
 ---
@@ -221,8 +307,9 @@ curl http://localhost:8080/api/v1/resolutions/36e45a12…ce26cc
 │   ├── semverx.py    # 自带 semver 解析与范围匹配引擎
 │   ├── solver.py     # 有向依赖图 + 确定性回溯求解器 + 冲突极小化
 │   ├── service.py    # 目录构建、求解编排、按指纹加锁复用
+│   ├── compare.py    # 两份 sat 结果的组件/边差异与反向边最短影响链
 │   └── storage.py    # SQLite 持久层（建表、读取、幂等写入）
-├── tests/            # pytest：semver 引擎 / 求解器 / API 端到端
+├── tests/            # pytest：semver 引擎 / 求解器 / 结果比较 / API 端到端
 ├── examples/resolve.json
 ├── Dockerfile
 ├── docker-compose.yml
@@ -250,7 +337,8 @@ python -m pytest -q
 
 测试覆盖：semver 全部范围语法与预发布门禁、SAT/UNSAT 场景、菱形依赖、
 环依赖、深度回溯、冲突链来源与极小化，以及 API 的提交、幂等复用、
-指纹查询、404/422/509 等。
+指纹查询、结果比较（五类组件变化、依赖边增删、反向边最短影响链、
+404/409/422）、404/422/509 等。
 
 ---
 
